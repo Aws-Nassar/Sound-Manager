@@ -329,7 +329,9 @@ class SoundManagerWindow(QMainWindow):
         self.pending_default_kind = None
         self.show_hidden = False
         self.current_kind = "output"
-        self.current_profile_name = "Default"
+        self.current_profile_name = self.state.get("current_profile", "Default")
+        if self.current_profile_name not in self.profiles:
+            self.current_profile_name = "Default"
 
         self.setWindowTitle("Sound Manager")
         if APP_ICON_PATH.exists():
@@ -720,6 +722,7 @@ class SoundManagerWindow(QMainWindow):
         self.state["hidden_devices"] = sorted(self.hidden_device_ids)
         self.state["rules"] = self.rules
         self.state["deleted_profiles"] = sorted(self.deleted_profile_names)
+        self.state["current_profile"] = self.current_profile_name
         self.state.setdefault("profiles", {})
 
         try:
@@ -776,6 +779,16 @@ class SoundManagerWindow(QMainWindow):
         else:
             self.inputs = devices
         self.priority_order[self.current_kind] = [device.device_id for device in devices]
+        self._save_state()
+
+    def _save_current_profile_snapshot(self) -> None:
+        if not self.current_profile_name or self.current_profile_name not in self.profiles:
+            return
+
+        profile = self._snapshot_current_profile(self.current_profile_name)
+        self.profiles[self.current_profile_name] = profile
+        self.state.setdefault("profiles", {})[self.current_profile_name] = profile
+        self.deleted_profile_names.discard(self.current_profile_name)
         self._save_state()
 
     def reload_devices(self, refresh: bool = False) -> None:
@@ -908,6 +921,7 @@ class SoundManagerWindow(QMainWindow):
         self._save_state()
         self.last_list_signature = None
         self.refresh()
+        self._save_current_profile_snapshot()
 
     def toggle_device_disabled(self, device_id: str) -> None:
         device = next((item for item in self.current_devices() if item.device_id == device_id), None)
@@ -942,6 +956,7 @@ class SoundManagerWindow(QMainWindow):
         self._save_state()
         self.last_list_signature = None
         self.refresh()
+        self._save_current_profile_snapshot()
 
     def _refresh_after_disable_action(self) -> None:
         self.reload_devices(refresh=True)
@@ -956,6 +971,7 @@ class SoundManagerWindow(QMainWindow):
                 break
 
         if not self.backend.available:
+            self._save_current_profile_snapshot()
             return
 
         self.pending_volume_change = (device_id, value)
@@ -970,6 +986,7 @@ class SoundManagerWindow(QMainWindow):
         try:
             self.backend.set_volume(device_id, value)
             self.status_label.setText(f"Volume set to {value}%.")
+            self._save_current_profile_snapshot()
         except Exception as exc:
             self.status_label.setText(f"Windows rejected the volume change: {exc}")
 
@@ -977,6 +994,10 @@ class SoundManagerWindow(QMainWindow):
         profile = self.profiles.get(profile_name)
         if not profile:
             return
+        if profile_name != self.current_profile_name:
+            self._save_current_profile_snapshot()
+
+        previous_disabled = set(self.disabled_device_ids)
         self.current_profile_name = profile_name
 
         self.outputs = self._order_for_profile("output", self.outputs, profile)
@@ -984,14 +1005,40 @@ class SoundManagerWindow(QMainWindow):
         self.priority_order["output"] = [device.device_id for device in self.outputs]
         self.priority_order["input"] = [device.device_id for device in self.inputs]
 
-        self._apply_profile_disabled_sources(profile)
+        self._apply_profile_disabled_sources(profile, apply_windows=False, previous_disabled=previous_disabled)
         self._apply_profile_hidden_sources(profile)
-        self._apply_profile_default("output", profile)
-        self._apply_profile_default("input", profile)
-        self._apply_profile_volumes(profile)
+        self._apply_profile_volumes(profile, apply_windows=False)
+        self._apply_profile_default("output", profile, apply_windows=False)
+        self._apply_profile_default("input", profile, apply_windows=False)
+        self._save_state()
+        self.status_label.setText(f"Applying {profile_name} profile to Windows...")
+        self._refresh_profile_buttons()
+        self.last_list_signature = None
+        self.refresh()
+        QTimer.singleShot(
+            80,
+            lambda name=profile_name, snapshot=dict(profile), disabled=previous_disabled: self._finish_profile_windows_apply(name, snapshot, disabled),
+        )
+
+    def _finish_profile_windows_apply(self, profile_name: str, profile: dict, previous_disabled: set[str]) -> None:
+        if profile_name != self.current_profile_name:
+            return
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            self._apply_profile_disabled_sources(profile, apply_windows=True, previous_disabled=previous_disabled)
+            self._apply_profile_default("output", profile, apply_windows=True)
+            self._apply_profile_default("input", profile, apply_windows=True)
+            self._apply_profile_volumes(profile, apply_windows=True)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        if profile_name != self.current_profile_name:
+            return
+
         self._save_state()
         self.status_label.setText(f"{profile_name} profile applied. {profile.get('description', '')}".strip())
-        self._refresh_profile_buttons()
+        self.last_list_signature = None
         self.refresh()
 
     def create_profile_from_current(self) -> None:
@@ -1063,14 +1110,15 @@ class SoundManagerWindow(QMainWindow):
         self.status_label.setText(f"{name} profile deleted.")
 
     def _snapshot_current_profile(self, name: str) -> dict:
+        existing = self.profiles.get(name, {})
         disabled = set(self.disabled_device_ids)
         hidden = set(self.hidden_device_ids)
         volumes = {device.device_id: device.level for device in self.outputs + self.inputs}
         output_default = next((device.device_id for device in self.outputs if not self._is_hidden_or_disabled(device)), "")
         input_default = next((device.device_id for device in self.inputs if not self._is_hidden_or_disabled(device)), "")
 
-        return {
-            "description": f"Saved snapshot for {name}.",
+        profile = {
+            "description": existing.get("description", f"Saved snapshot for {name}."),
             "output_order": [device.device_id for device in self.outputs],
             "input_order": [device.device_id for device in self.inputs],
             "output_default": output_default,
@@ -1079,6 +1127,9 @@ class SoundManagerWindow(QMainWindow):
             "hidden_devices": sorted(hidden),
             "disabled_devices": sorted(disabled),
         }
+        if existing.get("protected") or name in PROTECTED_PROFILES:
+            profile["protected"] = True
+        return profile
 
     def _order_for_profile(self, kind: str, devices: list[AudioDevice], profile: dict) -> list[AudioDevice]:
         order = profile.get(f"{kind}_order")
@@ -1091,11 +1142,11 @@ class SoundManagerWindow(QMainWindow):
 
         return self._rank_for_profile(devices, profile.get(f"{kind}_keywords", []))
 
-    def _apply_profile_disabled_sources(self, profile: dict) -> None:
+    def _apply_profile_disabled_sources(self, profile: dict, apply_windows: bool = True, previous_disabled: set[str] | None = None) -> None:
         if "disabled_devices" not in profile:
             return
 
-        previous = set(self.disabled_device_ids)
+        previous = set(self.disabled_device_ids if previous_disabled is None else previous_disabled)
         target = set(profile.get("disabled_devices", []))
         all_ids = {device.device_id for device in self.outputs + self.inputs}
         to_disable = sorted((target - previous) & all_ids)
@@ -1110,7 +1161,7 @@ class SoundManagerWindow(QMainWindow):
                 device.hidden = False
                 device.status = "Active"
 
-        if self.backend.available:
+        if apply_windows and self.backend.available:
             messages = []
             if to_disable:
                 messages.append(self.backend.set_many_enabled(to_disable, False))
@@ -1129,7 +1180,7 @@ class SoundManagerWindow(QMainWindow):
         for device in self.outputs + self.inputs:
             device.local_hidden = device.device_id in self.hidden_device_ids
 
-    def _apply_profile_volumes(self, profile: dict) -> None:
+    def _apply_profile_volumes(self, profile: dict, apply_windows: bool = True) -> None:
         volumes = profile.get("volumes", {})
         if not volumes:
             return
@@ -1140,7 +1191,7 @@ class SoundManagerWindow(QMainWindow):
 
             value = int(volumes[device.device_id])
             device.level = value
-            if self.backend.available:
+            if apply_windows and self.backend.available:
                 try:
                     self.backend.set_volume(device.device_id, value)
                 except Exception:
@@ -1156,13 +1207,20 @@ class SoundManagerWindow(QMainWindow):
 
         return sorted(devices, key=score)
 
-    def _apply_profile_default(self, kind: str, profile: dict) -> None:
+    def _apply_profile_default(self, kind: str, profile: dict, apply_windows: bool = True) -> None:
         devices = self.outputs if kind == "output" else self.inputs
         preferred_id = profile.get(f"{kind}_default", "")
         first_active = next((device for device in devices if device.device_id == preferred_id and not self._is_hidden_or_disabled(device)), None)
         if first_active is None:
             first_active = next((device for device in devices if not self._is_hidden_or_disabled(device)), None)
-        if not first_active or not self.backend.available:
+
+        for device in devices:
+            if device.status == "Default" and device is not first_active:
+                device.status = "Active"
+        if first_active:
+            first_active.status = "Default"
+
+        if not first_active or not apply_windows or not self.backend.available:
             return
 
         try:
@@ -1185,6 +1243,7 @@ class SoundManagerWindow(QMainWindow):
         self._schedule_default_from_priority()
         self.last_list_signature = None
         self.refresh()
+        self._save_current_profile_snapshot()
 
     def sort_current(self) -> None:
         devices = sorted(
@@ -1195,6 +1254,7 @@ class SoundManagerWindow(QMainWindow):
         self._schedule_default_from_priority()
         self.last_list_signature = None
         self.refresh()
+        self._save_current_profile_snapshot()
 
     def _sync_from_list_order(self) -> None:
         visible_ids = [
@@ -1209,6 +1269,7 @@ class SoundManagerWindow(QMainWindow):
         self._schedule_default_from_priority()
         self.last_list_signature = None
         self.refresh()
+        self._save_current_profile_snapshot()
 
     def _schedule_default_from_priority(self) -> None:
         if not self.backend.available:
@@ -1233,6 +1294,7 @@ class SoundManagerWindow(QMainWindow):
         try:
             self.backend.set_default(first_active.device_id)
             self.status_label.setText(f"Windows default {kind} set to {first_active.name}.")
+            self._save_current_profile_snapshot()
             QTimer.singleShot(1000, lambda: self.reload_devices(refresh=True))
         except Exception as exc:
             self.status_label.setText(f"Windows rejected the default-device change: {exc}")
