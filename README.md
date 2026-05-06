@@ -73,6 +73,8 @@ The generated app will be:
 dist\SoundManager.exe
 ```
 
+This is a one-file build. You can share `SoundManager.exe` by itself; you do not need to include `config.json`, `assets/`, or any Python files.
+
 To remove generated build output:
 
 ```powershell
@@ -105,7 +107,15 @@ Profiles save:
 - hidden devices
 - disabled devices
 
-The built-in profiles live in `config.json`. Your local profile edits are saved in `sound_manager_state.json`, which is intentionally ignored by Git because it contains machine-specific device IDs.
+When running from source, the built-in profiles can be edited in `config.json`. In the built EXE, those defaults are bundled inside the one-file app.
+
+Your local profile edits are saved per computer:
+
+```text
+%APPDATA%\Sound Manager\sound_manager_state.json
+```
+
+That file is intentionally outside the shared EXE folder because it contains machine-specific device IDs.
 
 The `Default` profile is protected. You can use it normally, but the app does not allow renaming or deleting it.
 

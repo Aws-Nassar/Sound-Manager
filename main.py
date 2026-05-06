@@ -1,5 +1,6 @@
 import ctypes
 import json
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,11 +44,13 @@ class AudioDevice:
     local_hidden: bool = False
 
 
-APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+IS_FROZEN = getattr(sys, "frozen", False)
+APP_DIR = Path(sys.executable).resolve().parent if IS_FROZEN else Path(__file__).resolve().parent
 RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
-CONFIG_PATH = APP_DIR / "config.json"
+CONFIG_PATH = (Path(__file__).resolve().parent / "config.json") if not IS_FROZEN else RESOURCE_DIR / "config.json"
 BUNDLED_CONFIG_PATH = RESOURCE_DIR / "config.json"
-STATE_PATH = APP_DIR / "sound_manager_state.json"
+STATE_DIR = (Path(os.environ.get("APPDATA", str(APP_DIR))) / "Sound Manager") if IS_FROZEN else APP_DIR
+STATE_PATH = STATE_DIR / "sound_manager_state.json"
 APP_ICON_PATH = RESOURCE_DIR / "assets" / "sound_manager.ico"
 
 DEFAULT_PROFILES = {
@@ -726,6 +729,7 @@ class SoundManagerWindow(QMainWindow):
         self.state.setdefault("profiles", {})
 
         try:
+            STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
             STATE_PATH.write_text(json.dumps(self.state, indent=2), encoding="utf-8")
         except OSError as exc:
             if hasattr(self, "status_label"):
