@@ -1,7 +1,7 @@
 import sys
 from dataclasses import dataclass
 
-from PyQt5.QtCore import Qt, QSize, pyqtSignal
+from PyQt5.QtCore import Qt, QSize, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QApplication,
@@ -21,6 +21,8 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from windows_audio import WindowsAudioBackend
 
 
 @dataclass
@@ -159,8 +161,10 @@ class StatCard(QFrame):
 class SoundManagerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.outputs = list(OUTPUT_DEVICES)
-        self.inputs = list(INPUT_DEVICES)
+        self.backend = WindowsAudioBackend()
+        self.outputs = []
+        self.inputs = []
+        self.priority_order = {"output": [], "input": []}
         self.show_hidden = False
         self.current_kind = "output"
 
@@ -170,7 +174,13 @@ class SoundManagerWindow(QMainWindow):
 
         self.setCentralWidget(self._build_ui())
         self._apply_style()
+        self.reload_devices()
         self.refresh()
+
+        self.poll_timer = QTimer(self)
+        self.poll_timer.setInterval(2500)
+        self.poll_timer.timeout.connect(lambda: self.reload_devices(refresh=True))
+        self.poll_timer.start()
 
     def _build_ui(self) -> QWidget:
         shell = QWidget()
@@ -289,6 +299,11 @@ class SoundManagerWindow(QMainWindow):
         header.addWidget(self.search)
         header.addWidget(self.hidden_toggle)
         layout.addLayout(header)
+
+        self.status_label = QLabel()
+        self.status_label.setObjectName("statusLabel")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
 
         stats = QGridLayout()
         stats.setHorizontalSpacing(14)
@@ -425,6 +440,35 @@ class SoundManagerWindow(QMainWindow):
             self.outputs = devices
         else:
             self.inputs = devices
+        self.priority_order[self.current_kind] = [device.device_id for device in devices]
+
+    def reload_devices(self, refresh: bool = False) -> None:
+        if self.backend.available:
+            self.outputs = self._apply_saved_order("output", self.backend.list_devices("output"))
+            self.inputs = self._apply_saved_order("input", self.backend.list_devices("input"))
+            if hasattr(self, "status_label") and not self.status_label.text():
+                self.status_label.setText("Connected to Windows Core Audio. Top priority changes update the real Windows default device.")
+        else:
+            self.outputs = self._apply_saved_order("output", list(OUTPUT_DEVICES))
+            self.inputs = self._apply_saved_order("input", list(INPUT_DEVICES))
+            if hasattr(self, "status_label"):
+                self.status_label.setText(self.backend.error or "Using sample devices because the Windows audio backend is unavailable.")
+
+        if refresh:
+            self.refresh()
+
+    def _apply_saved_order(self, kind: str, devices: list[AudioDevice]) -> list[AudioDevice]:
+        saved = self.priority_order[kind]
+        if not saved:
+            self.priority_order[kind] = [device.device_id for device in devices]
+            return devices
+
+        lookup = {device.device_id: device for device in devices}
+        ordered = [lookup[device_id] for device_id in saved if device_id in lookup]
+        ordered_ids = {device.device_id for device in ordered}
+        ordered.extend(device for device in devices if device.device_id not in ordered_ids)
+        self.priority_order[kind] = [device.device_id for device in ordered]
+        return ordered
 
     def refresh(self) -> None:
         if not hasattr(self, "list_widget"):
@@ -469,6 +513,17 @@ class SoundManagerWindow(QMainWindow):
         self.default_stat.value.setText(default)
 
     def toggle_device_hidden(self, device_id: str) -> None:
+        if self.backend.available:
+            device = next((item for item in self.current_devices() if item.device_id == device_id), None)
+            if not device:
+                return
+
+            enable_device = device.hidden
+            message = self.backend.set_enabled(device_id, enable_device)
+            self.status_label.setText(message)
+            QTimer.singleShot(1800, lambda: self.reload_devices(refresh=True))
+            return
+
         for device in self.current_devices():
             if device.device_id == device_id:
                 device.hidden = not device.hidden
@@ -484,6 +539,7 @@ class SoundManagerWindow(QMainWindow):
             return
         devices[index], devices[new_index] = devices[new_index], devices[index]
         self.set_current_devices(devices)
+        self._apply_default_from_priority()
         self.refresh()
 
     def sort_current(self) -> None:
@@ -492,6 +548,7 @@ class SoundManagerWindow(QMainWindow):
             key=lambda device: (device.hidden, device.status != "Default", -device.level),
         )
         self.set_current_devices(devices)
+        self._apply_default_from_priority()
         self.refresh()
 
     def _sync_from_list_order(self) -> None:
@@ -504,7 +561,24 @@ class SoundManagerWindow(QMainWindow):
         visible_devices = [lookup[device_id] for device_id in visible_ids if device_id in lookup]
         hidden_outside_filter = [device for device in devices if device.device_id not in visible_ids]
         self.set_current_devices(visible_devices + hidden_outside_filter)
+        self._apply_default_from_priority()
         self.refresh()
+
+    def _apply_default_from_priority(self) -> None:
+        if not self.backend.available:
+            return
+
+        first_active = next((device for device in self.current_devices() if not device.hidden), None)
+        if not first_active:
+            self.status_label.setText("No active device is available to set as the Windows default.")
+            return
+
+        try:
+            self.backend.set_default(first_active.device_id)
+            self.status_label.setText(f"Windows default {self.current_kind} set to {first_active.name}.")
+            QTimer.singleShot(500, lambda: self.reload_devices(refresh=True))
+        except Exception as exc:
+            self.status_label.setText(f"Windows rejected the default-device change: {exc}")
 
     def _apply_style(self) -> None:
         QApplication.instance().setFont(QFont("Segoe UI", 10))
@@ -537,10 +611,18 @@ class SoundManagerWindow(QMainWindow):
 
             QLabel#brandSubtitle,
             QLabel#hintBody,
+            QLabel#statusLabel,
             QLabel#deviceSubtitle,
             QLabel#ruleDetail,
             QLabel#activityText {
                 color: #9aa5b1;
+            }
+
+            QLabel#statusLabel {
+                background: #171b22;
+                border: 1px solid #2b333d;
+                border-radius: 10px;
+                padding: 10px 12px;
             }
 
             QPushButton#navButton,
