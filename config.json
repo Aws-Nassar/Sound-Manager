@@ -1,5 +1,14 @@
 {
   "profiles": {
+    "Default": {
+      "description": "Default Sound Manager view with active devices first.",
+      "output_keywords": [],
+      "input_keywords": [],
+      "hidden_devices": [],
+      "disabled_devices": [],
+      "volumes": {},
+      "protected": true
+    },
     "Work Mode": {
       "description": "Headset first for meetings, speakers as backup.",
       "output_keywords": ["headset", "arctis", "speakers", "realtek"],
