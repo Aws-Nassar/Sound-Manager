@@ -6,9 +6,12 @@ __pycache__/
 # Python build artifacts
 build/
 dist/
+out/
 *.egg-info/
 .eggs/
 *.egg
+pip-wheel-metadata/
+__pypackages__/
 
 # Virtual environments
 .venv/
@@ -18,32 +21,54 @@ ENV/
 
 # Installer and packaging outputs
 *.manifest
+*.msi
+*.zip
+*.7z
+*.tar
+*.gz
+*.log
+*.toc
+*.pkg
+*.pyz
+*.pyz_extracted/
 
 # Test, coverage, and tooling caches
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.pyright/
 .coverage
+.coverage.*
 htmlcov/
+coverage.xml
 
 # Local environment and secrets
 .env
 .env.*
 !.env.example
+*.local
 
 # Logs and local runtime output
-*.log
 logs/
 sound_manager_state.json
+*.sqlite
+*.sqlite3
 
 # Windows and editor files
 Thumbs.db
 Desktop.ini
 .DS_Store
+.vs/
 .vscode/
 .idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
 
 # Temporary files
 *.tmp
 *.temp
+*.bak
+*.orig
 ~$*
