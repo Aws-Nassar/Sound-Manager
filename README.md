@@ -8,14 +8,49 @@ A Windows desktop UI prototype for managing audio input and output devices.
 python main.py
 ```
 
-## Current Prototype
+## Build EXE
+
+```powershell
+.\tools\build_exe.ps1
+```
+
+The built app is written to:
+
+```text
+dist\SoundManager.exe
+```
+
+To remove generated build output:
+
+```powershell
+.\tools\build_exe.ps1 -Mode Clean
+```
+
+## Project Layout
+
+```text
+assets\sound_manager.ico
+assets\sound_manager.png
+tools\build_exe.ps1
+tools\generate_icon.py
+SoundManager.spec
+config.json
+main.py
+windows_audio.py
+```
+
+## Current Features
 
 - Separate priority lists for real Windows outputs and inputs.
 - Move devices up or down to control app priority.
 - The top visible device is applied as the real Windows default endpoint.
-- Disable or restore devices through Windows PnP commands.
+- Adjust input and output endpoint volume from inside the app.
+- Apply profile presets from `config.json`.
+- Save your current order, defaults, volumes, and disabled sources as a new profile.
+- Your current input/output sort order is saved in `sound_manager_state.json` and restored on the next run.
+- Disable or enable sources through Windows PnP commands so they stop appearing as app input/output choices.
 - Search devices and optionally show disabled, unplugged, and not-present endpoints.
-- Automation panel mockup for future Windows audio rules.
+- Smooth scroll behavior while Windows devices refresh in the background.
 
 ## Windows Notes
 

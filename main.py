@@ -1,8 +1,10 @@
+import json
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 from PyQt5.QtCore import Qt, QSize, QTimer, pyqtSignal
-from PyQt5.QtGui import QFont
+from PyQt5.QtGui import QFont, QIcon
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -14,10 +16,10 @@ from PyQt5.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QInputDialog,
     QPushButton,
-    QScrollArea,
     QSizePolicy,
-    QStackedWidget,
+    QSlider,
     QVBoxLayout,
     QWidget,
 )
@@ -34,6 +36,46 @@ class AudioDevice:
     status: str
     level: int
     hidden: bool = False
+    can_disable: bool = True
+
+
+APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
+CONFIG_PATH = APP_DIR / "config.json"
+BUNDLED_CONFIG_PATH = RESOURCE_DIR / "config.json"
+STATE_PATH = APP_DIR / "sound_manager_state.json"
+APP_ICON_PATH = RESOURCE_DIR / "assets" / "sound_manager.ico"
+
+DEFAULT_PROFILES = {
+    "Work Mode": {
+        "description": "Headset first for meetings, speakers as backup.",
+        "output_keywords": ["headset", "arctis", "speakers", "realtek"],
+        "input_keywords": ["microphone", "headset", "arctis", "webcam"],
+        "output_volume": 72,
+        "input_volume": 68,
+    },
+    "Gaming": {
+        "description": "Prioritize headset and VR/game endpoints.",
+        "output_keywords": ["headset", "arctis", "quest", "nvidia", "hdmi"],
+        "input_keywords": ["headset", "microphone", "arctis"],
+        "output_volume": 82,
+        "input_volume": 74,
+    },
+    "Recording": {
+        "description": "Studio interfaces first with calmer monitoring.",
+        "output_keywords": ["focusrite", "scarlett", "studio", "speakers"],
+        "input_keywords": ["scarlett", "focusrite", "microphone", "mic"],
+        "output_volume": 60,
+        "input_volume": 80,
+    },
+    "Clean": {
+        "description": "Prefer built-in stable devices and keep virtual endpoints lower.",
+        "output_keywords": ["speakers", "realtek", "headphones"],
+        "input_keywords": ["microphone", "array", "webcam"],
+        "output_volume": 65,
+        "input_volume": 60,
+    },
+}
 
 
 OUTPUT_DEVICES = [
@@ -55,6 +97,7 @@ INPUT_DEVICES = [
 class DeviceCard(QFrame):
     hide_requested = pyqtSignal(str)
     move_requested = pyqtSignal(str, int)
+    volume_requested = pyqtSignal(str, int)
 
     def __init__(self, device: AudioDevice, priority: int):
         super().__init__()
@@ -86,7 +129,7 @@ class DeviceCard(QFrame):
         title.setObjectName("deviceTitle")
         title.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
-        status = QLabel("Hidden" if device.hidden else device.status)
+        status = QLabel("Disabled" if device.hidden else device.status)
         status.setObjectName("statusPill")
         status.setProperty("tone", "muted" if device.hidden else ("default" if device.status == "Default" else "ready"))
 
@@ -109,13 +152,34 @@ class DeviceCard(QFrame):
         copy.addWidget(subtitle)
         copy.addWidget(meter)
 
+        volume_row = QHBoxLayout()
+        volume_row.setSpacing(10)
+        volume_label = QLabel(f"{device.level}%")
+        volume_label.setObjectName("volumeLabel")
+        volume_label.setFixedWidth(42)
+        volume_slider = QSlider(Qt.Horizontal)
+        volume_slider.setObjectName("volumeSlider")
+        volume_slider.setRange(0, 100)
+        volume_slider.setValue(device.level)
+        volume_slider.setEnabled(not device.hidden)
+        volume_slider.setCursor(Qt.PointingHandCursor)
+
+        def update_volume(value: int) -> None:
+            volume_label.setText(f"{value}%")
+            self.volume_requested.emit(device.device_id, value)
+
+        volume_slider.valueChanged.connect(update_volume)
+        volume_row.addWidget(volume_slider, 1)
+        volume_row.addWidget(volume_label)
+        copy.addLayout(volume_row)
+
         actions = QHBoxLayout()
         actions.setSpacing(6)
 
         up = self._icon_button("↑", "Move higher priority")
         down = self._icon_button("↓", "Move lower priority")
-        hide = self._icon_button("↺" if device.hidden else "×", "Restore device" if device.hidden else "Hide device")
-        hide.setObjectName("dangerIconButton" if not device.hidden else "restoreIconButton")
+        hide = self._action_button("Enable" if device.hidden else "Disable", "Enable this source" if device.hidden else "Disable this source")
+        hide.setObjectName("restoreActionButton" if device.hidden else "dangerActionButton")
 
         up.clicked.connect(lambda: self.move_requested.emit(device.device_id, -1))
         down.clicked.connect(lambda: self.move_requested.emit(device.device_id, 1))
@@ -135,6 +199,13 @@ class DeviceCard(QFrame):
         button.setObjectName("iconButton")
         button.setToolTip(tooltip)
         button.setFixedSize(34, 34)
+        button.setCursor(Qt.PointingHandCursor)
+        return button
+
+    def _action_button(self, text: str, tooltip: str) -> QPushButton:
+        button = QPushButton(text)
+        button.setToolTip(tooltip)
+        button.setFixedSize(76, 34)
         button.setCursor(Qt.PointingHandCursor)
         return button
 
@@ -164,11 +235,24 @@ class SoundManagerWindow(QMainWindow):
         self.backend = WindowsAudioBackend()
         self.outputs = []
         self.inputs = []
-        self.priority_order = {"output": [], "input": []}
+        self.state = self._load_state()
+        self.priority_order = self.state.get("priority_order", {"output": [], "input": []})
+        self.priority_order.setdefault("output", [])
+        self.priority_order.setdefault("input", [])
+        self.disabled_device_ids = set(self.state.get("disabled_devices", []))
+        self.profiles = self._load_profiles()
+        self.profile_buttons = {}
+        self.profile_layout = None
+        self.disable_refresh_attempts = 0
+        self.volume_update_timer = QTimer(self)
+        self.volume_update_timer.setSingleShot(True)
+        self.pending_volume_change = None
         self.show_hidden = False
         self.current_kind = "output"
 
         self.setWindowTitle("Sound Manager")
+        if APP_ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
         self.setMinimumSize(1120, 760)
         self.resize(1220, 820)
 
@@ -181,6 +265,7 @@ class SoundManagerWindow(QMainWindow):
         self.poll_timer.setInterval(2500)
         self.poll_timer.timeout.connect(lambda: self.reload_devices(refresh=True))
         self.poll_timer.start()
+        self.volume_update_timer.timeout.connect(self._flush_volume_change)
 
     def _build_ui(self) -> QWidget:
         shell = QWidget()
@@ -235,11 +320,16 @@ class SoundManagerWindow(QMainWindow):
         rules_title.setObjectName("sectionLabel")
         layout.addWidget(rules_title)
 
-        for text in ("Work Mode", "Gaming", "Recording"):
-            chip = QPushButton(text)
-            chip.setObjectName("profileButton")
-            chip.setCursor(Qt.PointingHandCursor)
-            layout.addWidget(chip)
+        self.profile_layout = QVBoxLayout()
+        self.profile_layout.setSpacing(8)
+        layout.addLayout(self.profile_layout)
+        self._refresh_profile_buttons()
+
+        save_profile = QPushButton("+ Save current profile")
+        save_profile.setObjectName("primarySideButton")
+        save_profile.setCursor(Qt.PointingHandCursor)
+        save_profile.clicked.connect(self.create_profile_from_current)
+        layout.addWidget(save_profile)
 
         layout.addStretch()
 
@@ -250,7 +340,7 @@ class SoundManagerWindow(QMainWindow):
         hint_layout.setSpacing(6)
         hint_title = QLabel("Quiet picker")
         hint_title.setObjectName("hintTitle")
-        hint_body = QLabel("Hidden devices stay out of your Windows input and output menus.")
+        hint_body = QLabel("Disabled sources stay out of Windows and app input/output menus until you enable them again.")
         hint_body.setObjectName("hintBody")
         hint_body.setWordWrap(True)
         hint_layout.addWidget(hint_title)
@@ -291,7 +381,7 @@ class SoundManagerWindow(QMainWindow):
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self.refresh)
 
-        self.hidden_toggle = QCheckBox("Show hidden")
+        self.hidden_toggle = QCheckBox("Show disabled")
         self.hidden_toggle.setObjectName("showHidden")
         self.hidden_toggle.stateChanged.connect(self._toggle_hidden)
 
@@ -308,7 +398,7 @@ class SoundManagerWindow(QMainWindow):
         stats = QGridLayout()
         stats.setHorizontalSpacing(14)
         self.visible_stat = StatCard("Visible devices", "0", "green")
-        self.hidden_stat = StatCard("Hidden devices", "0", "amber")
+        self.hidden_stat = StatCard("Disabled sources", "0", "amber")
         self.default_stat = StatCard("Current default", "None", "coral")
         stats.addWidget(self.visible_stat, 0, 0)
         stats.addWidget(self.hidden_stat, 0, 1)
@@ -339,6 +429,7 @@ class SoundManagerWindow(QMainWindow):
         self.list_widget.setSpacing(10)
         self.list_widget.setDragDropMode(QListWidget.InternalMove)
         self.list_widget.setDefaultDropAction(Qt.MoveAction)
+        self.list_widget.setVerticalScrollMode(QListWidget.ScrollPerPixel)
         self.list_widget.model().rowsMoved.connect(self._sync_from_list_order)
 
         list_layout.addLayout(panel_top)
@@ -422,6 +513,63 @@ class SoundManagerWindow(QMainWindow):
         layout.addWidget(toggle)
         return row
 
+    def _refresh_profile_buttons(self) -> None:
+        if self.profile_layout is None:
+            return
+
+        while self.profile_layout.count():
+            item = self.profile_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        self.profile_buttons = {}
+        for text in self.profiles:
+            chip = QPushButton(text)
+            chip.setObjectName("profileButton")
+            chip.setCursor(Qt.PointingHandCursor)
+            chip.setToolTip(self.profiles[text].get("description", "Apply this audio profile."))
+            chip.clicked.connect(lambda checked=False, name=text: self.apply_profile(name))
+            self.profile_buttons[text] = chip
+            self.profile_layout.addWidget(chip)
+
+    def _load_state(self) -> dict:
+        if not STATE_PATH.exists():
+            return {}
+
+        try:
+            data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _save_state(self) -> None:
+        self.state["priority_order"] = self.priority_order
+        self.state["disabled_devices"] = sorted(self.disabled_device_ids)
+        self.state.setdefault("profiles", {})
+
+        try:
+            STATE_PATH.write_text(json.dumps(self.state, indent=2), encoding="utf-8")
+        except OSError as exc:
+            if hasattr(self, "status_label"):
+                self.status_label.setText(f"Could not save app state: {exc}")
+
+    def _load_profiles(self) -> dict:
+        path = CONFIG_PATH if CONFIG_PATH.exists() else BUNDLED_CONFIG_PATH
+        profiles = dict(DEFAULT_PROFILES)
+        if not path.exists():
+            profiles.update(self.state.get("profiles", {}))
+            return profiles
+
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            profiles.update(data.get("profiles", {}))
+            profiles.update(self.state.get("profiles", {}))
+            return profiles
+        except (OSError, json.JSONDecodeError):
+            profiles.update(self.state.get("profiles", {}))
+            return profiles
+
     def set_kind(self, kind: str) -> None:
         self.current_kind = kind
         self.output_nav.setChecked(kind == "output")
@@ -441,16 +589,20 @@ class SoundManagerWindow(QMainWindow):
         else:
             self.inputs = devices
         self.priority_order[self.current_kind] = [device.device_id for device in devices]
+        self._save_state()
 
     def reload_devices(self, refresh: bool = False) -> None:
+        if refresh and QApplication.mouseButtons() != Qt.NoButton:
+            return
+
         if self.backend.available:
-            self.outputs = self._apply_saved_order("output", self.backend.list_devices("output"))
-            self.inputs = self._apply_saved_order("input", self.backend.list_devices("input"))
+            self.outputs = self._apply_disabled_overrides(self._apply_saved_order("output", self.backend.list_devices("output")))
+            self.inputs = self._apply_disabled_overrides(self._apply_saved_order("input", self.backend.list_devices("input")))
             if hasattr(self, "status_label") and not self.status_label.text():
                 self.status_label.setText("Connected to Windows Core Audio. Top priority changes update the real Windows default device.")
         else:
-            self.outputs = self._apply_saved_order("output", list(OUTPUT_DEVICES))
-            self.inputs = self._apply_saved_order("input", list(INPUT_DEVICES))
+            self.outputs = self._apply_disabled_overrides(self._apply_saved_order("output", list(OUTPUT_DEVICES)))
+            self.inputs = self._apply_disabled_overrides(self._apply_saved_order("input", list(INPUT_DEVICES)))
             if hasattr(self, "status_label"):
                 self.status_label.setText(self.backend.error or "Using sample devices because the Windows audio backend is unavailable.")
 
@@ -470,6 +622,14 @@ class SoundManagerWindow(QMainWindow):
         self.priority_order[kind] = [device.device_id for device in ordered]
         return ordered
 
+    def _apply_disabled_overrides(self, devices: list[AudioDevice]) -> list[AudioDevice]:
+        for device in devices:
+            if device.device_id in self.disabled_device_ids:
+                device.hidden = True
+                device.status = "Disabled"
+                device.level = 0
+        return devices
+
     def refresh(self) -> None:
         if not hasattr(self, "list_widget"):
             return
@@ -487,6 +647,7 @@ class SoundManagerWindow(QMainWindow):
             and (not query or query in device.name.lower() or query in device.subtitle.lower())
         ]
 
+        scroll_value = self.list_widget.verticalScrollBar().value()
         self.list_widget.blockSignals(True)
         self.list_widget.clear()
         for priority, device in enumerate(visible, start=1):
@@ -495,10 +656,12 @@ class SoundManagerWindow(QMainWindow):
             card = DeviceCard(device, priority)
             card.hide_requested.connect(self.toggle_device_hidden)
             card.move_requested.connect(self.move_device)
-            item.setSizeHint(QSize(100, 92))
+            card.volume_requested.connect(self.set_device_volume)
+            item.setSizeHint(QSize(100, 126))
             self.list_widget.addItem(item)
             self.list_widget.setItemWidget(item, card)
         self.list_widget.blockSignals(False)
+        self.list_widget.verticalScrollBar().setValue(scroll_value)
 
         self._update_stats()
 
@@ -513,23 +676,201 @@ class SoundManagerWindow(QMainWindow):
         self.default_stat.value.setText(default)
 
     def toggle_device_hidden(self, device_id: str) -> None:
-        if self.backend.available:
-            device = next((item for item in self.current_devices() if item.device_id == device_id), None)
-            if not device:
-                return
-
-            enable_device = device.hidden
-            message = self.backend.set_enabled(device_id, enable_device)
-            self.status_label.setText(message)
-            QTimer.singleShot(1800, lambda: self.reload_devices(refresh=True))
+        device = next((item for item in self.current_devices() if item.device_id == device_id), None)
+        if not device:
             return
 
+        enable_device = device.hidden
+
+        if self.backend.available:
+            message = self.backend.set_enabled(device_id, enable_device)
+            self.status_label.setText(message)
+            if "cancelled" not in message.lower() and "blocked" not in message.lower():
+                self._set_device_hidden_locally(device_id, not enable_device)
+                self.disable_refresh_attempts = 8
+                QTimer.singleShot(1000, self._refresh_after_disable_action)
+            return
+
+        self._set_device_hidden_locally(device_id, not enable_device)
+
+    def _set_device_hidden_locally(self, device_id: str, hidden: bool) -> None:
+        if hidden:
+            self.disabled_device_ids.add(device_id)
+        else:
+            self.disabled_device_ids.discard(device_id)
+
+        for collection in (self.outputs, self.inputs):
+            for device in collection:
+                if device.device_id == device_id:
+                    device.hidden = hidden
+                    device.status = "Disabled" if hidden else "Active"
+                    break
+        self._save_state()
+        self.refresh()
+
+    def _refresh_after_disable_action(self) -> None:
+        self.reload_devices(refresh=True)
+        self.disable_refresh_attempts -= 1
+        if self.disable_refresh_attempts > 0:
+            QTimer.singleShot(1200, self._refresh_after_disable_action)
+
+    def set_device_volume(self, device_id: str, value: int) -> None:
         for device in self.current_devices():
             if device.device_id == device_id:
-                device.hidden = not device.hidden
-                device.status = "Hidden" if device.hidden else "Ready"
+                device.level = value
                 break
+
+        if not self.backend.available:
+            return
+
+        self.pending_volume_change = (device_id, value)
+        self.volume_update_timer.start(120)
+
+    def _flush_volume_change(self) -> None:
+        if not self.pending_volume_change:
+            return
+
+        device_id, value = self.pending_volume_change
+        self.pending_volume_change = None
+        try:
+            self.backend.set_volume(device_id, value)
+            self.status_label.setText(f"Volume set to {value}%.")
+        except Exception as exc:
+            self.status_label.setText(f"Windows rejected the volume change: {exc}")
+
+    def apply_profile(self, profile_name: str) -> None:
+        profile = self.profiles.get(profile_name)
+        if not profile:
+            return
+
+        self.outputs = self._order_for_profile("output", self.outputs, profile)
+        self.inputs = self._order_for_profile("input", self.inputs, profile)
+        self.priority_order["output"] = [device.device_id for device in self.outputs]
+        self.priority_order["input"] = [device.device_id for device in self.inputs]
+
+        self._apply_profile_disabled_sources(profile)
+        self._apply_profile_default("output", profile)
+        self._apply_profile_default("input", profile)
+        self._apply_profile_volumes(profile)
+        self._save_state()
+        self.status_label.setText(f"{profile_name} profile applied. {profile.get('description', '')}".strip())
         self.refresh()
+
+    def create_profile_from_current(self) -> None:
+        name, accepted = QInputDialog.getText(self, "Save profile", "Profile name:")
+        name = name.strip()
+        if not accepted or not name:
+            return
+
+        profile = self._snapshot_current_profile(name)
+        self.profiles[name] = profile
+        self.state.setdefault("profiles", {})[name] = profile
+        self._save_state()
+        self._refresh_profile_buttons()
+        self.status_label.setText(f"{name} profile saved with current order, volumes, defaults, and disabled sources.")
+
+    def _snapshot_current_profile(self, name: str) -> dict:
+        disabled = set(self.disabled_device_ids)
+        disabled.update(device.device_id for device in self.outputs + self.inputs if device.hidden)
+        volumes = {device.device_id: device.level for device in self.outputs + self.inputs}
+        output_default = next((device.device_id for device in self.outputs if not device.hidden), "")
+        input_default = next((device.device_id for device in self.inputs if not device.hidden), "")
+
+        return {
+            "description": f"Saved snapshot for {name}.",
+            "output_order": [device.device_id for device in self.outputs],
+            "input_order": [device.device_id for device in self.inputs],
+            "output_default": output_default,
+            "input_default": input_default,
+            "volumes": volumes,
+            "disabled_devices": sorted(disabled),
+        }
+
+    def _order_for_profile(self, kind: str, devices: list[AudioDevice], profile: dict) -> list[AudioDevice]:
+        order = profile.get(f"{kind}_order")
+        if order:
+            lookup = {device.device_id: device for device in devices}
+            ordered = [lookup[device_id] for device_id in order if device_id in lookup]
+            ordered_ids = {device.device_id for device in ordered}
+            ordered.extend(device for device in devices if device.device_id not in ordered_ids)
+            return ordered
+
+        return self._rank_for_profile(devices, profile.get(f"{kind}_keywords", []))
+
+    def _apply_profile_disabled_sources(self, profile: dict) -> None:
+        if "disabled_devices" not in profile:
+            return
+
+        previous = set(self.disabled_device_ids)
+        target = set(profile.get("disabled_devices", []))
+        all_ids = {device.device_id for device in self.outputs + self.inputs}
+        to_disable = sorted((target - previous) & all_ids)
+        to_enable = sorted((previous - target) & all_ids)
+
+        self.disabled_device_ids = target
+        for device in self.outputs + self.inputs:
+            if device.device_id in target:
+                device.hidden = True
+                device.status = "Disabled"
+            elif device.device_id in previous:
+                device.hidden = False
+                device.status = "Active"
+
+        if self.backend.available:
+            messages = []
+            if to_disable:
+                messages.append(self.backend.set_many_enabled(to_disable, False))
+            if to_enable:
+                messages.append(self.backend.set_many_enabled(to_enable, True))
+            if messages:
+                self.status_label.setText(" ".join(messages))
+                self.disable_refresh_attempts = 8
+                QTimer.singleShot(1000, self._refresh_after_disable_action)
+
+    def _apply_profile_volumes(self, profile: dict) -> None:
+        volumes = profile.get("volumes", {})
+        if not volumes:
+            return
+
+        for device in self.outputs + self.inputs:
+            if device.device_id not in volumes or device.hidden:
+                continue
+
+            value = int(volumes[device.device_id])
+            device.level = value
+            if self.backend.available:
+                try:
+                    self.backend.set_volume(device.device_id, value)
+                except Exception:
+                    pass
+
+    def _rank_for_profile(self, devices: list[AudioDevice], keywords: list[str]) -> list[AudioDevice]:
+        normalized = [keyword.lower() for keyword in keywords]
+
+        def score(device: AudioDevice) -> tuple[int, int, str]:
+            haystack = f"{device.name} {device.subtitle}".lower()
+            match_index = next((index for index, keyword in enumerate(normalized) if keyword in haystack), len(normalized))
+            return (device.hidden, match_index, device.name.lower())
+
+        return sorted(devices, key=score)
+
+    def _apply_profile_default(self, kind: str, profile: dict) -> None:
+        devices = self.outputs if kind == "output" else self.inputs
+        preferred_id = profile.get(f"{kind}_default", "")
+        first_active = next((device for device in devices if device.device_id == preferred_id and not device.hidden), None)
+        if first_active is None:
+            first_active = next((device for device in devices if not device.hidden), None)
+        if not first_active or not self.backend.available:
+            return
+
+        try:
+            self.backend.set_default(first_active.device_id)
+            volume = profile.get(f"{kind}_volume")
+            if volume is not None:
+                first_active.level = int(volume)
+                self.backend.set_volume(first_active.device_id, int(volume))
+        except Exception as exc:
+            self.status_label.setText(f"Could not fully apply {kind} profile: {exc}")
 
     def move_device(self, device_id: str, direction: int) -> None:
         devices = self.current_devices()
@@ -855,6 +1196,53 @@ class SoundManagerWindow(QMainWindow):
             QLabel#activityTime {
                 color: #65e4d1;
                 font-weight: 800;
+            }
+
+            QLabel#volumeLabel {
+                color: #cbd5df;
+                font-weight: 800;
+            }
+
+            QSlider#volumeSlider::groove:horizontal {
+                background: #11151a;
+                border-radius: 4px;
+                height: 8px;
+            }
+
+            QSlider#volumeSlider::sub-page:horizontal {
+                background: #65e4d1;
+                border-radius: 4px;
+            }
+
+            QSlider#volumeSlider::handle:horizontal {
+                background: #f8fafc;
+                border: 2px solid #65e4d1;
+                border-radius: 8px;
+                width: 16px;
+                margin: -5px 0;
+            }
+
+            QScrollBar:vertical {
+                background: #141820;
+                border: 0;
+                border-radius: 6px;
+                width: 12px;
+                margin: 2px;
+            }
+
+            QScrollBar::handle:vertical {
+                background: #3a4654;
+                border-radius: 6px;
+                min-height: 42px;
+            }
+
+            QScrollBar::handle:vertical:hover {
+                background: #65e4d1;
+            }
+
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical {
+                height: 0;
             }
             """
         )

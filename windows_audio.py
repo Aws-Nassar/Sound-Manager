@@ -93,13 +93,30 @@ class WindowsAudioBackend:
             [self.ERole.eConsole, self.ERole.eMultimedia, self.ERole.eCommunications],
         )
 
+    def set_volume(self, device_id: str, percent: int) -> None:
+        if not self.available or not device_id:
+            return
+
+        percent = max(0, min(100, int(percent)))
+        device = self.AudioUtilities.GetDeviceEnumerator().GetDevice(device_id)
+        endpoint = self.AudioUtilities.CreateDevice(device)
+        endpoint.EndpointVolume.SetMasterVolumeLevelScalar(percent / 100, None)
+
     def set_enabled(self, device_id: str, enabled: bool) -> str:
         if not device_id:
             return "Device ID is missing."
 
+        return self.set_many_enabled([device_id], enabled)
+
+    def set_many_enabled(self, device_ids: list[str], enabled: bool) -> str:
+        device_ids = [device_id for device_id in device_ids if device_id]
+        if not device_ids:
+            return "No device changes needed."
+
         cmdlet = "Enable-PnpDevice" if enabled else "Disable-PnpDevice"
-        instance_id = self._pnp_instance_id(device_id)
-        script = f"{cmdlet} -InstanceId '{instance_id}' -Confirm:$false"
+        instance_ids = [self._pnp_instance_id(device_id).replace("'", "''") for device_id in device_ids]
+        quoted_ids = ", ".join(f"'{instance_id}'" for instance_id in instance_ids)
+        script = f"$ids = @({quoted_ids}); foreach ($id in $ids) {{ {cmdlet} -InstanceId $id -Confirm:$false }}"
 
         if self._is_admin():
             completed = subprocess.run(

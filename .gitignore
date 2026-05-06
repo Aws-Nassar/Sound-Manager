@@ -17,7 +17,6 @@ env/
 ENV/
 
 # Installer and packaging outputs
-*.spec
 *.manifest
 
 # Test, coverage, and tooling caches
@@ -35,6 +34,7 @@ htmlcov/
 # Logs and local runtime output
 *.log
 logs/
+sound_manager_state.json
 
 # Windows and editor files
 Thumbs.db

@@ -1,0 +1,32 @@
+{
+  "profiles": {
+    "Work Mode": {
+      "description": "Headset first for meetings, speakers as backup.",
+      "output_keywords": ["headset", "arctis", "speakers", "realtek"],
+      "input_keywords": ["microphone", "headset", "arctis", "webcam"],
+      "output_volume": 72,
+      "input_volume": 68
+    },
+    "Gaming": {
+      "description": "Prioritize headset and VR/game endpoints.",
+      "output_keywords": ["headset", "arctis", "quest", "nvidia", "hdmi"],
+      "input_keywords": ["headset", "microphone", "arctis"],
+      "output_volume": 82,
+      "input_volume": 74
+    },
+    "Recording": {
+      "description": "Studio interfaces first with calmer monitoring.",
+      "output_keywords": ["focusrite", "scarlett", "studio", "speakers"],
+      "input_keywords": ["scarlett", "focusrite", "microphone", "mic"],
+      "output_volume": 60,
+      "input_volume": 80
+    },
+    "Clean": {
+      "description": "Prefer built-in stable devices and keep virtual endpoints lower.",
+      "output_keywords": ["speakers", "realtek", "headphones"],
+      "input_keywords": ["microphone", "array", "webcam"],
+      "output_volume": 65,
+      "input_volume": 60
+    }
+  }
+}
